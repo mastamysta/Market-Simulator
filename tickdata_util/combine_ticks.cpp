@@ -8,6 +8,8 @@
 
 #include <stdarg.h>
 
+#include "tick_data.hpp"
+
 #define MODULE_NAME "TICK_COMBINER"
 
 void logit(const char *fmt, ...)
@@ -21,37 +23,6 @@ void logit(const char *fmt, ...)
 #define INFO(fmt, ...) logit(MODULE_NAME "_INFO: " fmt, ##__VA_ARGS__)
 #define ERROR(fmt, ...) logit(MODULE_NAME "_ERROR: " fmt, ##__VA_ARGS__)
 
-// Just a number of milis from the beginning of the day.
-struct time
-{
-    unsigned long long int milis;
-};
-
-enum instrument
-{
-    EURUSD = 0,
-    USDJPY = 1,
-    GBPUSD = 2
-};
-
-static std::map<std::string, instrument> instrument_map =
-{
-    { "EURUSD" , EURUSD },
-    { "GBPUSD" , GBPUSD },
-    { "USDJPY" , USDJPY }
-};
-
-struct state
-{
-    instrument ins;
-
-    double ask;
-    double bid;
-    double askVol;
-    double bidVol;
-};
-
-using tick = std::pair<struct time, struct state>;
 
 tick generate_tick_from_line(instrument instrument, const std::string& line)
 {
@@ -109,7 +80,7 @@ instrument get_instrument_from_filename(const char *filename)
         exit(-1);
     }
 
-    return instrument_map[instr_buf];
+    return instrument_map.find(instr_buf)->second;
 }
 
 void parse_file(std::vector<tick>& ticklist, const char *filename)
