@@ -6,22 +6,10 @@
 #include <sstream>
 #include <map>
 
-#include <stdarg.h>
-
 #include "tick_data.hpp"
+#include "logging.hpp"
 
 #define MODULE_NAME "TICK_COMBINER"
-
-void logit(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    vprintf(fmt, args);
-    va_end(args);
-}
-
-#define INFO(fmt, ...) logit(MODULE_NAME "_INFO: " fmt, ##__VA_ARGS__)
-#define ERROR(fmt, ...) logit(MODULE_NAME "_ERROR: " fmt, ##__VA_ARGS__)
 
 
 tick generate_tick_from_line(instrument instrument, const std::string& line)
