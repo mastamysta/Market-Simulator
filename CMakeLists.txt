@@ -13,3 +13,6 @@ add_subdirectory(tickdata_util)
 # A program to take in historical order data and order feed data from simlated market participants
 # and maintain an order book.
 add_subdirectory(sim)
+
+# A matching engine
+add_subdirectory(matching_engine)
