@@ -8,8 +8,8 @@
 #include <set>
 #include <array>
 #include <concepts>
-
-#include <iostream>
+#include <functional>
+#include <unordered_map>
 
 #include "logging.hpp"
 
@@ -22,22 +22,14 @@ static constexpr float tick_size = 0.05;
 
 using ticks = uint32_t; 
 using units = uint16_t;
-using order_id = std::array<char, 128>;
+using order_id = uint64_t;
 using time_priority = uint16_t;
+using participant_id = uint16_t;
+using order_executed_callback = std::function<bool(participant_id, order_id, units)>;
 
-static constexpr order_id PLACE_ORDER_FAILED = []()
-{
-    order_id ret = { 0 };
-    ret[127] = 0xFF;
-    return ret;
-}();
-
-static constexpr order_id PLACE_ORDER_FILLED_IMMEDIATELY = []()
-{
-    order_id ret = { 0 };
-    ret[127] = 0xEE;
-    return ret;
-}();
+static constexpr order_id INVALID_ID = UINT64_MAX - 2;
+static constexpr order_id PLACE_ORDER_FAILED = UINT64_MAX - 1;
+static constexpr order_id PLACE_ORDER_FILLED_IMMEDIATELY = UINT64_MAX;
 
 enum class cancel_status : uint32_t
 {
@@ -51,6 +43,8 @@ concept IOrderData = requires(T v, ticks p)
     requires std::same_as<decltype(v.price), ticks>;
     requires std::same_as<decltype(v.size), units>;
     requires std::same_as<decltype(v.priority), time_priority>;
+    requires std::same_as<decltype(v.agent_id), participant_id>;
+    requires std::same_as<decltype(v.id), order_id>;
 
     requires std::same_as<decltype(v.can_fill(p)), bool>;
 };
@@ -60,6 +54,8 @@ struct order_data_sell
     ticks price;
     units size;
     time_priority priority;
+    participant_id agent_id;
+    order_id id;
 
     inline bool can_fill(const ticks buy_price) { return buy_price >= price;  }
 };
@@ -69,6 +65,8 @@ struct order_data_buy
     ticks price;
     units size;
     time_priority priority;
+    participant_id agent_id;
+    order_id id;
 
     inline bool can_fill(const ticks sell_price) { return price >= sell_price;  }
 };
@@ -76,10 +74,7 @@ struct order_data_buy
 int operator<=>(const order_data_sell& lhs, const order_data_sell& rhs)
 {
     if (lhs.price == rhs.price && lhs.priority == rhs.priority)
-    {
-        ERROR("Two sell orders' could not be sorted.\n");
-        return 0; // Should never get here. Orders at same price should *always* get a different priority in time
-    }
+        return 0; // We get here when attempting to delete an order. Priorities must be unique!
 
     if (lhs.price < rhs.price || (lhs.price == rhs.price && lhs.priority < rhs.priority))
         return -1;
@@ -90,16 +85,32 @@ int operator<=>(const order_data_sell& lhs, const order_data_sell& rhs)
 int operator<=>(const order_data_buy& lhs, const order_data_buy& rhs)
 {
     if (lhs.price == rhs.price && lhs.priority == rhs.priority)
-    {
-        ERROR("Two buy orders' could not be sorted.\n");
-        return 0; // Should never get here. Orders at same price should *always* get a different priority in time
-    }
+        return 0; // We get here when attempting to delete an order. Priorities must be unique!
     
     if (lhs.price > rhs.price || (lhs.price == rhs.price && lhs.priority < rhs.priority))
         return -1;
     
     return 1;
 }
+
+template <IOrderData order_data>
+struct market_side
+{
+    std::set<order_data> book = { };
+    std::unordered_map<order_id, order_data> id_map = { };
+
+    auto insert_order(const order_data& order)
+    {
+        book.insert(order);
+        id_map[order.id] = order;
+    }
+
+    auto remove_order(const order_data& order) -> void
+    {
+        id_map.erase(order.id);
+        book.erase(order);
+    }
+};
 
 // Given a set of limit buy/sell orders, implement a singlethreaded matching algorithm to match orders. It must:
 //  Match orders in O(1)
@@ -109,6 +120,11 @@ int operator<=>(const order_data_buy& lhs, const order_data_buy& rhs)
 class matching_engine
 {
 public:
+
+    auto register_order_executed_callback(order_executed_callback cb) -> void
+    {
+        exec_cb = cb;
+    }
     
     // Return UINT64_MAX for failure
     auto place_limit_buy(const ticks price, const units size) -> order_id
@@ -125,14 +141,16 @@ public:
         {
             .price = price,
             .size = leftover_size,
-            .priority = buy_price_count_table[price]
+            .priority = buy_price_count_table[price],
+            .id = id_cnt
         };
 
+        buy_side.insert_order(order);
+
         buy_price_count_table[price]++;
+        id_cnt++;
 
-        buy_side.insert(order);        
-
-        return order_data_to_order_id(order);
+        return order.id;
     }
 
     // Return UINT64_MAX for failure
@@ -150,14 +168,16 @@ public:
         {
             .price = price,
             .size = leftover_size,
-            .priority = sell_price_count_table[price]
+            .priority = sell_price_count_table[price],
+            .id = id_cnt
         };
 
+        sell_side.insert_order(order);
+
         sell_price_count_table[price]++;
+        id_cnt++;
 
-        sell_side.insert(order);
-
-        return order_data_to_order_id(order);
+        return order.id;
     }
 
     auto cancel(const order_id id) -> cancel_status
@@ -174,76 +194,75 @@ private:
     // in the price-time ordering.
     // Order ID's are simply the raw order data serialized. We can hash this if we want to obfuscate later.
     std::map<float, time_priority> buy_price_count_table, sell_price_count_table;
-    std::set<order_data_buy> buy_side;
-    std::set<order_data_sell> sell_side;
+    market_side<order_data_buy> buy_side;
+    market_side<order_data_sell> sell_side;
 
-    template <IOrderData order_data>
-    union order_u
-    {
-        order_data data;
-        order_id id;
-    };
+    order_id id_cnt = 0;
 
-    // Directly convert the data into an integer
+    order_executed_callback exec_cb;
+
+    // Notify a counterparty to a partial or complete sale of an order
     template <IOrderData order_data>
-    auto order_data_to_order_id(const order_data& order) -> order_id
+    auto notify(order_data order, units size) -> void
     {
-        order_u o = { .data = order };
-        return o.id;
+        if (!exec_cb)
+        {
+            ERROR("Attempted to notify of order completion, but no notification callback has been registered.\n");
+            return;
+        }
+
+        exec_cb(order.agent_id, order.id, size);
     }
-
-    // Directly convert order id to order data
-    // template <IOrderData order_data>
-    // auto order_id_to_order_data(const order_id id) -> order_data
-    // {
-    //     order_u o = { .id = id };
-    //     return o.data;
-    // }
 
     // Returns false if we succeed in immediately filling the order.
     template <IOrderData order_data>
-    auto fill(std::set<order_data>& side, const ticks price, const units size, units& leftover_size) -> bool
+    auto fill(market_side<order_data>& side, const ticks price, const units size, units& leftover_size) -> bool
     {
-        if (!side.size())
+        if (!side.book.size())
             return true;
 
-        order_data best;
+        // Get iterator and value of best
+        auto best_it = side.book.begin();
+        auto best = *best_it;
         leftover_size = size;
 
         while (best.can_fill(price))
         {
-            best = *(side.begin());
-
             INFO("Best price: %lu worst price: %lu.\n",
                             best.price,
-                            (*(side.rbegin())).price);
+                            (*(side.book.rbegin())).price);
 
-            INFO("Best price: %lu best time: %hu second price: %lu second time: %hu", 
+            INFO("Best price: %lu best time: %hu second price: %lu second time: %hu\n", 
                                                         best.price, 
                                                         best.priority, 
-                                                        (*(std::next(side.begin()))).price, 
-                                                        (*(std::next(side.begin()))).priority);
+                                                        (*(std::next(side.book.begin()))).price, 
+                                                        (*(std::next(side.book.begin()))).priority);
 
             if (best.size < leftover_size)
             {
-                // TODO: Notify the seller of full sale
-                side.erase(side.begin());
+                notify(best, best.size);
+
+                side.remove_order(best);
                 leftover_size -= best.size;
             }
             else if (best.size > leftover_size)
             {
-                // TODO: Notify seller of partial sale? How does this work IRL?
-                side.erase(side.begin());
+                notify(best, leftover_size);
+
+                side.remove_order(best);
                 best.size -= size;
-                side.insert(best); // TODO: New order needs new ID, and we need to supply that back to the seller - or map old ID to new ID.
+                side.insert_order(best); // TODO: It would be good to ammend an order rather than doing a full removal and reinsert.
                 return false; // No point reevaluating the conditions, we've successfully bought all we can!
             }
             else // best.size == leftover_size
             {
-                // TODO: Notify the seller of full sale
-                side.erase(side.begin());
+                notify(best, best.size);
+
+                side.remove_order(best);
                 return false;
             }
+
+            best = *(side.book.begin());
         }
 
         return true;
